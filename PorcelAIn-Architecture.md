@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-PorcelAIn is a lightweight .NET 10 RESTful API for hosting a single local Large Language Model (LLM) or Small Language Model (SLM). Built with minimal APIs and zero-ceremony approach, it provides HTTP endpoints for text generation with support for ONNX, GGUF, and Hugging Face model formats. The model type and path are configured via appsettings.json for maximum simplicity.
+PorcelAIn is a lightweight .NET 10 RESTful API for hosting a single local Large Language Model (LLM) or Small Language Model (SLM). Built with minimal APIs and zero-ceremony approach, it provides HTTP endpoints for text generation with support for PyTorch (.pt/.pth), ONNX, and Hugging Face model formats. The model type and path are configured via appsettings.json for maximum simplicity.
 
 ## Architecture Philosophy
 
@@ -29,6 +29,7 @@ PorcelAIn is a lightweight .NET 10 RESTful API for hosting a single local Large 
 - **Native AOT Ready**: Optimized for single-file deployment
 
 ### LLM Integration (Choose One)
+- **TorchSharp**: For PyTorch model files (.pt/.pth) - **Current Implementation**
 - **Microsoft.ML.OnnxRuntime**: For ONNX model files
 - **LLamaSharp**: For GGUF model files (llama.cpp backend)
 - **Hugging Face Transformers.NET**: For HF model files
@@ -42,7 +43,9 @@ PorcelAIn is a lightweight .NET 10 RESTful API for hosting a single local Large 
 PorcelAIn/
 ├── Program.cs          # Complete application in one file
 ├── appsettings.json    # Model configuration only
-├── Models/             # Single model file storage
+├── Models/             # PyTorch model and tokenizer storage
+│   ├── model.pt        # PyTorch model file
+│   └── vocab.json      # Tokenizer vocabulary
 └── README.md           # Usage instructions
 ```
 
@@ -70,10 +73,11 @@ The entire application fits in `Program.cs` with three main sections:
 
 ## Key Components Design
 
-### 1. Complete Program.cs (150-200 lines total)
+### 1. Complete Program.cs (300+ lines total)
 ```csharp
 // Program.cs - Complete REST API in one file
-using Microsoft.ML.OnnxRuntime;
+using TorchSharp;
+using static TorchSharp.torch;
 using System.Text.Json;
 
 // Configuration
@@ -81,41 +85,73 @@ var builder = WebApplication.CreateSlimBuilder(args);
 var config = builder.Configuration;
 
 // Load model based on appsettings
-var modelPath = config["Model:Path"];
-var modelType = config["Model:Type"]; // "onnx", "gguf", or "huggingface"
+var modelPath = config["Model:Path"] ?? "./Models/model.pt";
+var modelType = config["Model:Type"]?.ToLower() ?? "pytorch";
+var vocabPath = config["Model:VocabPath"] ?? "./Models/vocab.json";
 
-// Create model provider (simple factory)
-object modelProvider = modelType.ToLower() switch
+// Initialize TorchSharp
+var device = torch.cuda.is_available() ? torch.CUDA : torch.CPU;
+
+// Load PyTorch model
+torch.jit.ScriptModule? model = null;
+Dictionary<string, int>? tokenizer = null;
+
+try
 {
-    "onnx" => new InferenceSession(modelPath),
-    "gguf" => new LLamaSharp.LLamaWeights(modelPath),
-    "huggingface" => new HuggingFace.Pipeline(modelPath),
-    _ => throw new InvalidOperationException($"Unsupported model type: {modelType}")
-};
+    model = torch.jit.load(modelPath, device);
+    model.eval();
+    
+    if (File.Exists(vocabPath))
+    {
+        var vocabJson = await File.ReadAllTextAsync(vocabPath);
+        tokenizer = JsonSerializer.Deserialize<Dictionary<string, int>>(vocabJson);
+    }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Failed to load model: {ex.Message}");
+    Environment.Exit(1);
+}
 
 var app = builder.Build();
 
 // API Endpoints
 app.MapPost("/generate", async (GenerateRequest request) => 
 {
-    var response = await GenerateText(modelProvider, request.Prompt);
-    return Results.Ok(new { text = response });
+    var inputTokens = TokenizeText(request.Prompt, tokenizer);
+    var generatedText = await GenerateWithTorch(model, inputTokens, request);
+    return Results.Ok(new { text = generatedText });
 });
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy", model = modelType }));
-app.MapGet("/info", () => Results.Ok(new { type = modelType, path = modelPath }));
+app.MapGet("/health", () => Results.Ok(new { 
+    status = "healthy", 
+    model = modelType,
+    device = device.ToString()
+}));
+
+app.MapGet("/info", () => Results.Ok(new { 
+    type = modelType, 
+    path = modelPath,
+    torchVersion = torch.version,
+    cudaAvailable = torch.cuda.is_available()
+}));
 
 app.Run();
 
 // Simple request/response models
 record GenerateRequest(string Prompt, int MaxTokens = 100, float Temperature = 0.7f);
 
-// Model-specific generation logic
-async Task<string> GenerateText(object provider, string prompt) => provider switch
+// TorchSharp inference logic
+async Task<string> GenerateWithTorch(torch.jit.ScriptModule model, long[] inputTokens, GenerateRequest request)
 {
-    InferenceSession onnx => await GenerateWithOnnx(onnx, prompt),
-    // ... other providers
-};
+    using (torch.no_grad())
+    {
+        var inputTensor = torch.tensor(inputTokens, device: device).unsqueeze(0);
+        var outputs = model.forward(inputTensor);
+        // ... generation logic
+        return generatedText;
+    }
+}
 ```
 
 ### 2. Configuration-Only Approach
@@ -214,17 +250,25 @@ record GenerateResponse(
 
 ### Model-Specific Implementation Variants
 
-#### ONNX Variant (Simplest)
+#### PyTorch Variant (Current Implementation)
+```csharp
+// Focus: TorchSharp + PyTorch ecosystem
+// Pros: Native PyTorch models, GPU acceleration, research ecosystem
+// Cons: Larger runtime, requires model conversion or training
+// Models: .pt, .pth files from PyTorch training or torch.jit.script()
+```
+
+#### ONNX Variant (Cross-Platform)
 ```csharp
 // Focus: Microsoft.ML.OnnxRuntime only
 // Pros: Official Microsoft support, broad model compatibility
 // Cons: Larger runtime, more setup complexity
 ```
 
-#### GGUF Variant (Most Popular)
+#### GGUF Variant (Optimized for CPUs)
 ```csharp  
 // Focus: LLamaSharp + llama.cpp only
-// Pros: Excellent performance, active community
+// Pros: Excellent CPU performance, quantized models
 // Cons: C++ dependencies, platform-specific builds
 ```
 
@@ -274,8 +318,9 @@ record GenerateResponse(
 // appsettings.json - Complete configuration
 {
   "Model": {
-    "Type": "gguf",
-    "Path": "./Models/llama-7b-q4.gguf",  
+    "Type": "pytorch",
+    "Path": "./Models/model.pt",  
+    "VocabPath": "./Models/vocab.json",
     "MaxTokens": 2048,
     "Temperature": 0.7
   },
@@ -313,8 +358,10 @@ Check API and model status
 // Response
 {
   "status": "healthy",
-  "model": "gguf",
-  "modelPath": "./Models/llama-7b-q4.gguf"
+  "model": "pytorch",
+  "modelPath": "./Models/model.pt",
+  "device": "CPU",
+  "tokenizerLoaded": true
 }
 ```
 
@@ -323,10 +370,17 @@ Get model capabilities
 ```json
 // Response
 {
-  "type": "gguf", 
+  "type": "pytorch", 
+  "path": "./Models/model.pt",
+  "vocabPath": "./Models/vocab.json",
   "maxTokens": 2048,
-  "contextWindow": 4096,
-  "modelSize": "7B parameters"
+  "contextWindow": 2048,
+  "modelSizeMB": 4096,
+  "temperature": 0.7,
+  "device": "CPU",
+  "torchVersion": "2.1.0",
+  "cudaAvailable": false,
+  "vocabSize": 32000
 }
 ```
 
@@ -334,6 +388,8 @@ Get model capabilities
 
 This minimal architecture prioritizes simplicity and performance over extensibility. The single-file approach eliminates architectural complexity while providing a robust REST API for local LLM inference. 
 
-The configuration-driven model selection allows easy switching between ONNX, GGUF, and Hugging Face models without code changes. Native AOT compilation ensures fast startup and small deployment size, making it ideal for local development tools and edge deployment scenarios.
+The current TorchSharp implementation provides native PyTorch model support with GPU acceleration capabilities, making it ideal for research and development scenarios. The configuration-driven model selection allows easy switching between PyTorch, ONNX, GGUF, and Hugging Face models with minimal code changes.
 
-The stateless design keeps memory usage predictable and eliminates session management complexity, while the direct model access pattern maximizes inference performance by removing abstraction overhead. 
+Native AOT compilation ensures fast startup and small deployment size, making it ideal for local development tools and edge deployment scenarios. The stateless design keeps memory usage predictable and eliminates session management complexity, while the direct model access pattern maximizes inference performance by removing abstraction overhead.
+
+**Current Implementation**: TorchSharp provides excellent performance for PyTorch models with proper GPU utilization and supports the full PyTorch ecosystem including custom models and fine-tuned variants. 
