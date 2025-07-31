@@ -1,0 +1,8 @@
+﻿bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+wwwroot/lib/
+Models/      # Local LLM models (large files)
