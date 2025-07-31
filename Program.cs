@@ -1,22 +1,24 @@
 ﻿#!/usr/bin/dotnet run
 #:sdk Microsoft.NET.Sdk.Web
-#:package LLamaSharp@0.*
-#:package LLamaSharp.Backend.Cpu@0.*
+#:package Microsoft.ML.OnnxRuntime@1.*
+#:package Microsoft.ML.Tokenizers@0.*
 #:property LangVersion=preview
 #:property PublishAot=true
 
-using LLama.Common;
-using LLama;
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.Tokenizers;
 using System.Text.Json;
 using System.Diagnostics;
+using System.Collections.Generic;
 
 // Configuration and startup
 var builder = WebApplication.CreateSlimBuilder(args);
 var config = builder.Configuration;
 
 // Load model configuration
-var modelPath = config["Model:Path"] ?? "./Models/model.gguf";
-var modelType = config["Model:Type"]?.ToLower() ?? "gguf";
+var modelPath = config["Model:Path"] ?? "./Models/model.onnx";
+var modelType = config["Model:Type"]?.ToLower() ?? "onnx";
+var tokenizerPath = config["Model:TokenizerPath"] ?? "./Models/tokenizer.json";
 var maxTokens = config.GetValue<int>("Model:MaxTokens", 2048);
 var temperature = config.GetValue<float>("Model:Temperature", 0.7f);
 
@@ -27,28 +29,38 @@ if (!File.Exists(modelPath))
     Environment.Exit(1);
 }
 
-// Initialize model provider
-Console.WriteLine($"Loading {modelType} model from: {modelPath}");
-var modelParams = new ModelParams(modelPath)
+// Initialize ONNX session options
+var sessionOptions = new SessionOptions
 {
-    ContextSize = (uint)maxTokens,
-    GpuLayerCount = 0 // CPU only for maximum compatibility
+    ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
+    GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL
 };
 
-LLamaWeights? model = null;
-LLamaContext? context = null;
-InteractiveExecutor? executor = null;
+InferenceSession? onnxSession = null;
+Tokenizer? tokenizer = null;
 
 try
 {
-    model = LLamaWeights.LoadFromFile(modelParams);
-    context = model.CreateContext(modelParams);
-    executor = new InteractiveExecutor(context);
-    Console.WriteLine("Model loaded successfully!");
+    Console.WriteLine($"Loading {modelType} model from: {modelPath}");
+    onnxSession = new InferenceSession(modelPath, sessionOptions);
+    
+    // Load tokenizer if available
+    if (File.Exists(tokenizerPath))
+    {
+        Console.WriteLine($"Loading tokenizer from: {tokenizerPath}");
+        tokenizer = Tokenizer.CreateTiktokenForModel("gpt-4"); // Fallback tokenizer
+    }
+    else
+    {
+        Console.WriteLine("Using default tokenizer");
+        tokenizer = Tokenizer.CreateTiktokenForModel("gpt-4");
+    }
+    
+    Console.WriteLine("ONNX model loaded successfully!");
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"Failed to load model: {ex.Message}");
+    Console.WriteLine($"Failed to load ONNX model: {ex.Message}");
     Environment.Exit(1);
 }
 
@@ -75,26 +87,52 @@ app.MapPost("/generate", async (GenerateRequest request) =>
     try
     {
         var stopwatch = Stopwatch.StartNew();
-        var inferenceParams = new InferenceParams()
+        
+        // Tokenize input prompt
+        var encodedTokens = tokenizer!.EncodeToIds(request.Prompt);
+        var inputIds = encodedTokens.ToArray();
+        
+        // Prepare input tensors
+        var inputTensor = NamedOnnxValue.CreateFromTensor("input_ids", 
+            new DenseTensor<long>(inputIds.Select(x => (long)x).ToArray(), new[] { 1, inputIds.Length }));
+        
+        var inputs = new List<NamedOnnxValue> { inputTensor };
+        
+        // Generate tokens
+        var generatedTokens = new List<int>(inputIds);
+        var tokensGenerated = 0;
+        
+        for (int i = 0; i < request.MaxTokens && tokensGenerated < request.MaxTokens; i++)
         {
-            Temperature = request.Temperature,
-            TopP = request.TopP,
-            MaxTokens = request.MaxTokens,
-            AntiPrompts = request.StopSequences?.ToList() ?? new()
-        };
-
-        var response = new List<string>();
-        await foreach (var token in executor!.InferAsync(request.Prompt, inferenceParams))
-        {
-            response.Add(token);
+            // Run inference
+            using var results = onnxSession!.Run(inputs);
+            var logits = results.First().AsTensor<float>();
+            
+            // Apply temperature sampling
+            var nextTokenId = SampleWithTemperature(logits, request.Temperature);
+            generatedTokens.Add(nextTokenId);
+            tokensGenerated++;
+            
+            // Check for stop sequences
+            var currentText = tokenizer.Decode(generatedTokens.Skip(inputIds.Length).ToArray());
+            if (request.StopSequences?.Any(stop => currentText.Contains(stop)) == true)
+                break;
+            
+            // Update input for next iteration (sliding window approach)
+            var newInputIds = generatedTokens.TakeLast(Math.Min(generatedTokens.Count, 512)).ToArray();
+            inputTensor = NamedOnnxValue.CreateFromTensor("input_ids",
+                new DenseTensor<long>(newInputIds.Select(x => (long)x).ToArray(), new[] { 1, newInputIds.Length }));
+            inputs[0] = inputTensor;
         }
-
+        
         stopwatch.Stop();
-        var generatedText = string.Join("", response);
+        
+        // Decode only the generated portion
+        var generatedText = tokenizer.Decode(generatedTokens.Skip(inputIds.Length).ToArray());
         
         return Results.Ok(new GenerateResponse(
             Text: generatedText,
-            TokensGenerated: response.Count,
+            TokensGenerated: tokensGenerated,
             ProcessingTimeMs: (float)stopwatch.Elapsed.TotalMilliseconds
         ));
     }
@@ -105,9 +143,46 @@ app.MapPost("/generate", async (GenerateRequest request) =>
     }
 });
 
+// Helper method for temperature sampling
+static int SampleWithTemperature(Tensor<float> logits, float temperature)
+{
+    var lastTokenLogits = logits.GetSlice(new[] { 0L, logits.Dimensions[1] - 1 }).ToArray();
+    
+    if (temperature <= 0.0f)
+    {
+        // Greedy sampling - return token with highest probability
+        return Array.IndexOf(lastTokenLogits, lastTokenLogits.Max());
+    }
+    
+    // Apply temperature
+    for (int i = 0; i < lastTokenLogits.Length; i++)
+    {
+        lastTokenLogits[i] /= temperature;
+    }
+    
+    // Softmax
+    var maxLogit = lastTokenLogits.Max();
+    var expLogits = lastTokenLogits.Select(x => Math.Exp(x - maxLogit)).ToArray();
+    var sumExp = expLogits.Sum();
+    var probabilities = expLogits.Select(x => x / sumExp).ToArray();
+    
+    // Sample from probability distribution
+    var random = new Random();
+    var sample = random.NextDouble();
+    var cumulative = 0.0;
+    
+    for (int i = 0; i < probabilities.Length; i++)
+    {
+        cumulative += probabilities[i];
+        if (sample < cumulative) return i;
+    }
+    
+    return probabilities.Length - 1;
+}
+
 app.MapGet("/health", () =>
 {
-    var isHealthy = model != null && context != null && executor != null;
+    var isHealthy = onnxSession != null && tokenizer != null;
     return Results.Ok(new
     {
         status = isHealthy ? "healthy" : "unhealthy",
@@ -159,8 +234,7 @@ try
 finally
 {
     // Cleanup resources
-    executor?.Dispose();
-    context?.Dispose();
-    model?.Dispose();
+    onnxSession?.Dispose();
+    tokenizer?.Dispose();
     Console.WriteLine("Resources cleaned up. Goodbye!");
 }
