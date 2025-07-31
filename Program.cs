@@ -1,12 +1,11 @@
 ﻿#!/usr/bin/dotnet run
 #:sdk Microsoft.NET.Sdk.Web
-#:package LLamaSharp@0.*
-#:package LLamaSharp.Backend.Cpu@0.*
+#:package OllamaSharp@3.*
 #:property LangVersion=preview
 #:property PublishAot=true
 
-using LLama.Common;
-using LLama;
+using OllamaSharp;
+using OllamaSharp.Models;
 using System.Text.Json;
 using System.Diagnostics;
 
@@ -14,41 +13,39 @@ using System.Diagnostics;
 var builder = WebApplication.CreateSlimBuilder(args);
 var config = builder.Configuration;
 
-// Load model configuration
-var modelPath = config["Model:Path"] ?? "./Models/model.gguf";
-var modelType = config["Model:Type"]?.ToLower() ?? "gguf";
-var maxTokens = config.GetValue<int>("Model:MaxTokens", 2048);
-var temperature = config.GetValue<float>("Model:Temperature", 0.7f);
+// Load Ollama configuration
+var ollamaUrl = config["Ollama:Url"] ?? "http://localhost:11434";
+var modelName = config["Ollama:Model"] ?? "llama3.2";
+var maxTokens = config.GetValue<int>("Ollama:MaxTokens", 2048);
+var temperature = config.GetValue<float>("Ollama:Temperature", 0.7f);
 
-// Validate model file exists
-if (!File.Exists(modelPath))
-{
-    Console.WriteLine($"Error: Model file not found at {modelPath}");
-    Environment.Exit(1);
-}
+// Initialize Ollama client
+Console.WriteLine($"Connecting to Ollama service at: {ollamaUrl}");
+var ollama = new OllamaApiClient(ollamaUrl);
 
-// Initialize model provider
-Console.WriteLine($"Loading {modelType} model from: {modelPath}");
-var modelParams = new ModelParams(modelPath)
-{
-    ContextSize = (uint)maxTokens,
-    GpuLayerCount = 0 // CPU only for maximum compatibility
-};
-
-LLamaWeights? model = null;
-LLamaContext? context = null;
-InteractiveExecutor? executor = null;
-
+// Verify Ollama service and model availability
 try
 {
-    model = LLamaWeights.LoadFromFile(modelParams);
-    context = model.CreateContext(modelParams);
-    executor = new InteractiveExecutor(context);
-    Console.WriteLine("Model loaded successfully!");
+    Console.WriteLine($"Checking Ollama service availability...");
+    var models = await ollama.ListLocalModelsAsync();
+    
+    if (!models.Any(m => m.Name.Contains(modelName)))
+    {
+        Console.WriteLine($"Warning: Model '{modelName}' not found locally. Available models:");
+        foreach (var availableModel in models)
+        {
+            Console.WriteLine($"  - {availableModel.Name}");
+        }
+        Console.WriteLine($"Attempting to pull model '{modelName}'...");
+        await ollama.PullModelAsync(modelName);
+    }
+    
+    Console.WriteLine($"Model '{modelName}' is ready!");
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"Failed to load model: {ex.Message}");
+    Console.WriteLine($"Failed to connect to Ollama service: {ex.Message}");
+    Console.WriteLine($"Make sure Ollama is running at {ollamaUrl}");
     Environment.Exit(1);
 }
 
@@ -75,26 +72,28 @@ app.MapPost("/generate", async (GenerateRequest request) =>
     try
     {
         var stopwatch = Stopwatch.StartNew();
-        var inferenceParams = new InferenceParams()
+        var ollamaRequest = new OllamaSharp.Models.GenerateRequest
         {
-            Temperature = request.Temperature,
-            TopP = request.TopP,
-            MaxTokens = request.MaxTokens,
-            AntiPrompts = request.StopSequences?.ToList() ?? new()
+            Model = modelName,
+            Prompt = request.Prompt,
+            Options = new RequestOptions
+            {
+                Temperature = request.Temperature,
+                TopP = request.TopP,
+                NumPredict = request.MaxTokens,
+                Stop = request.StopSequences
+            }
         };
 
-        var response = new List<string>();
-        await foreach (var token in executor!.InferAsync(request.Prompt, inferenceParams))
-        {
-            response.Add(token);
-        }
-
+        var response = await ollama.GenerateAsync(ollamaRequest);
         stopwatch.Stop();
-        var generatedText = string.Join("", response);
+        
+        // Approximate token count (OllamaSharp doesn't provide exact token count)
+        var estimatedTokens = response.Response?.Split(' ', StringSplitOptions.RemoveEmptyEntries)?.Length ?? 0;
         
         return Results.Ok(new GenerateResponse(
-            Text: generatedText,
-            TokensGenerated: response.Count,
+            Text: response.Response ?? "",
+            TokensGenerated: estimatedTokens,
             ProcessingTimeMs: (float)stopwatch.Elapsed.TotalMilliseconds
         ));
     }
@@ -105,30 +104,52 @@ app.MapPost("/generate", async (GenerateRequest request) =>
     }
 });
 
-app.MapGet("/health", () =>
-{
-    var isHealthy = model != null && context != null && executor != null;
-    return Results.Ok(new
-    {
-        status = isHealthy ? "healthy" : "unhealthy",
-        model = modelType,
-        modelPath = modelPath
-    });
-});
-
-app.MapGet("/info", () =>
+app.MapGet("/health", async () =>
 {
     try
     {
-        var fileInfo = new FileInfo(modelPath);
+        // Test Ollama service connectivity
+        var models = await ollama.ListLocalModelsAsync();
+        var modelExists = models.Any(m => m.Name.Contains(modelName));
+        
         return Results.Ok(new
         {
-            type = modelType,
-            path = modelPath,
+            status = modelExists ? "healthy" : "model_not_found",
+            service = "ollama",
+            serviceUrl = ollamaUrl,
+            model = modelName,
+            modelAvailable = modelExists
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new
+        {
+            status = "unhealthy",
+            service = "ollama",
+            serviceUrl = ollamaUrl,
+            error = ex.Message
+        });
+    }
+});
+
+app.MapGet("/info", async () =>
+{
+    try
+    {
+        var models = await ollama.ListLocalModelsAsync();
+        var currentModel = models.FirstOrDefault(m => m.Name.Contains(modelName));
+        
+        return Results.Ok(new
+        {
+            service = "ollama",
+            serviceUrl = ollamaUrl,
+            model = modelName,
             maxTokens = maxTokens,
-            contextWindow = maxTokens,
-            modelSizeMB = fileInfo.Length / (1024 * 1024),
-            temperature = temperature
+            temperature = temperature,
+            modelSizeMB = currentModel?.Size / (1024 * 1024) ?? 0,
+            modelFamily = currentModel?.Details?.Family ?? "unknown",
+            availableModels = models.Select(m => m.Name).ToArray()
         });
     }
     catch (Exception ex)
@@ -159,8 +180,6 @@ try
 finally
 {
     // Cleanup resources
-    executor?.Dispose();
-    context?.Dispose();
-    model?.Dispose();
+    ollama?.Dispose();
     Console.WriteLine("Resources cleaned up. Goodbye!");
 }

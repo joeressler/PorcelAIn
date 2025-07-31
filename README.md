@@ -1,13 +1,15 @@
 # PorcelAIn - Minimal Local LLM REST API
 
-A lightweight .NET 10 REST API for hosting a single local Large Language Model (LLM) using GGUF format via LLamaSharp.
+A lightweight .NET 10 REST API for hosting Large Language Models (LLM) via OllamaSharp and the Ollama service.
 
 ## Features
 
-- **Minimal footprint**: Single-file application (~167 lines)
-- **Configuration-driven**: Model selection via `appsettings.json`
-- **GGUF support**: Optimized for llama.cpp models
+- **Minimal footprint**: Single-file application (~186 lines)
+- **Configuration-driven**: Ollama service and model selection via `appsettings.json`
+- **Ollama integration**: Access to entire Ollama model ecosystem
+- **Automatic model management**: Models are downloaded automatically if not available
 - **REST endpoints**: Simple HTTP API for text generation 
+- **Service separation**: API and model hosting are decoupled
 - **Native AOT ready**: Fast startup, small deployment size
 
 ## Quick Start
@@ -15,43 +17,89 @@ A lightweight .NET 10 REST API for hosting a single local Large Language Model (
 ### 1. Prerequisites
 
 - .NET 10 Preview or later
-- A GGUF model file (e.g., from Hugging Face)
+- Ollama service installed and running ([ollama.ai](https://ollama.ai))
+- At least one Ollama model pulled (e.g., `ollama pull llama3.2`)
 
-### 2. Configure Model
+### 2. Start Ollama Service
+
+```bash
+# Install a model (if not already done)
+ollama pull llama3.2
+
+# Start Ollama service
+ollama serve
+```
+
+### 3. Configure Ollama Connection
 
 Edit `appsettings.json`:
 
 ```json
 {
-  "Model": {
-    "Type": "gguf",
-    "Path": "./Models/your-model.gguf", 
+  "Ollama": {
+    "Url": "http://localhost:11434",
+    "Model": "llama3.2", 
     "MaxTokens": 2048,
     "Temperature": 0.7
   }
 }
 ```
 
-### 3. Add Model File
-
-Place your GGUF model in the `Models/` directory:
-
-```
-PorcelAIn/
-├── Models/
-│   └── your-model.gguf    <- Your model file here
-├── Program.cs             <- Complete application (167 lines)
-├── appsettings.json       <- Model configuration
-└── README.md              <- This file
-```
-
 ### 4. Run
 
 ```bash
+# Ensure Ollama is running first
+ollama serve &
+
+# Run PorcelAIn API
 dotnet run Program.cs
 ```
 
 The API will start on `http://localhost:5000`
+
+**Note**: Ollama service must be running on `http://localhost:11434` (default)
+
+## Popular Models
+
+Here are some recommended models you can use with Ollama:
+
+```bash
+# Small, fast models (good for development)
+ollama pull phi3:mini          # ~2GB - Microsoft Phi-3 Mini
+ollama pull llama3.2:1b        # ~1GB - Meta Llama 3.2 1B
+
+# Medium models (balanced performance)
+ollama pull llama3.2:3b        # ~2GB - Meta Llama 3.2 3B
+ollama pull mistral:7b         # ~4GB - Mistral 7B
+
+# Large models (best quality)
+ollama pull llama3.2:8b        # ~5GB - Meta Llama 3.2 8B
+ollama pull codellama:13b      # ~7GB - Code Llama 13B (for coding)
+
+# Specialized models
+ollama pull codellama:7b       # ~4GB - Code generation
+ollama pull deepseek-coder:6.7b # ~4GB - Advanced coding model
+```
+
+Update your `appsettings.json` with the model name:
+```json
+{
+  "Ollama": {
+    "Model": "llama3.2:3b"  // <- Use any pulled model
+  }
+}
+```
+
+## Project Structure
+
+```
+PorcelAIn/
+├── Program.cs             <- Complete application (186 lines)
+├── appsettings.json       <- Ollama configuration
+└── README.md              <- This file
+```
+
+**Note**: No `Models/` directory needed - models are managed by Ollama service.
 
 ## API Endpoints
 
@@ -79,29 +127,33 @@ Generate text from a prompt
 ```
 
 ### GET /health
-Check API and model status
+Check API and Ollama service status
 
 **Response:**
 ```json
 {
   "status": "healthy",
-  "model": "gguf", 
-  "modelPath": "./Models/your-model.gguf"
+  "service": "ollama", 
+  "serviceUrl": "http://localhost:11434",
+  "model": "llama3.2",
+  "modelAvailable": true
 }
 ```
 
 ### GET /info  
-Get model information
+Get Ollama service and model information
 
 **Response:**
 ```json
 {
-  "type": "gguf",
-  "path": "./Models/your-model.gguf",
+  "service": "ollama",
+  "serviceUrl": "http://localhost:11434",
+  "model": "llama3.2",
   "maxTokens": 2048,
-  "contextWindow": 2048,
+  "temperature": 0.7,
   "modelSizeMB": 4096,
-  "temperature": 0.7
+  "modelFamily": "llama",
+  "availableModels": ["llama3.2", "codellama", "mistral"]
 }
 ```
 
@@ -158,40 +210,52 @@ Creates a single executable (20-50MB) with no external dependencies.
 # Run with hot reload
 dotnet watch run Program.cs
 
-# Run with custom model
-Model__Path="./Models/different-model.gguf" dotnet run Program.cs
+# Run with different Ollama model
+Ollama__Model="codellama" dotnet run Program.cs
+
+# Run with different Ollama service URL
+Ollama__Url="http://remote-ollama:11434" dotnet run Program.cs
 ```
 
 ## Configuration
 
 Environment variables override `appsettings.json`:
 
-- `Model__Path`: Path to model file
-- `Model__Type`: Model type (currently only "gguf")  
-- `Model__MaxTokens`: Maximum context size
-- `Model__Temperature`: Default temperature
+- `Ollama__Url`: Ollama service URL (default: http://localhost:11434)
+- `Ollama__Model`: Model name to use (e.g., "llama3.2", "codellama")  
+- `Ollama__MaxTokens`: Maximum tokens to generate
+- `Ollama__Temperature`: Default temperature for generation
 
 ## Requirements
 
-- **Memory**: Varies by model size (4GB+ recommended for 7B models)
+- **Ollama Service**: Must be installed and running separately
+- **Memory**: Managed by Ollama service (4GB+ recommended for 7B models)
 - **CPU**: Any 64-bit processor (ARM64 supported)
-- **Storage**: Model file size + ~50MB for application
+- **Storage**: ~50MB for PorcelAIn API + models managed by Ollama
+- **Network**: HTTP access to Ollama service (default: localhost:11434)
 
 ## Troubleshooting
 
-### "Model file not found"
-- Verify the path in `appsettings.json` 
-- Ensure the model file exists and is readable
+### "Failed to connect to Ollama service"
+- Verify Ollama is running: `ollama serve`
+- Check the service URL in `appsettings.json`
+- Ensure port 11434 is not blocked by firewall
 
-### "Failed to load model"
-- Check if you have enough RAM for the model
-- Verify the GGUF file is not corrupted
-- Try a smaller quantized model (Q4_0, Q4_1)
+### "Model not found"
+- Pull the model: `ollama pull llama3.2`
+- Check available models: `ollama list`
+- Verify model name matches exactly in configuration
+
+### "Generation failed" or timeout
+- Check Ollama service logs: `ollama logs`
+- Reduce `MaxTokens` in configuration
+- Try a smaller/faster model (e.g., `phi3:mini`)
+- Ensure Ollama has sufficient memory allocated
 
 ### High memory usage
-- Reduce `MaxTokens` in configuration
-- Use a more quantized model variant
-- Enable `InvariantGlobalization=true` for smaller footprint
+- Memory is managed by Ollama service, not PorcelAIn
+- Configure Ollama's model concurrency settings
+- Use smaller models or quantized variants via Ollama
 
 ## License
 
