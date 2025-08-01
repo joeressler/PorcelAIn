@@ -4,11 +4,11 @@ A lightweight .NET 10 REST API for hosting a single local Large Language Model (
 
 ## Features
 
-- **Minimal footprint**: Single-file application (~167 lines)
+- **Minimal footprint**: Single-file application (~194 lines)
 - **Configuration-driven**: Model selection via `appsettings.json`
-- **GGUF support**: Optimized for llama.cpp models
+- **GGUF support**: Optimized for llama.cpp models via LLamaSharp
 - **REST endpoints**: Simple HTTP API for text generation 
-- **Native AOT ready**: Fast startup, small deployment size
+- **Native AOT ready**: Fast startup, small deployment size with proper JSON serialization
 
 ## Quick Start
 
@@ -25,7 +25,7 @@ Edit `appsettings.json`:
 {
   "Model": {
     "Type": "gguf",
-    "Path": "./Models/your-model.gguf", 
+    "Path": "./Models/phi-4-Q2_K.gguf", 
     "MaxTokens": 2048,
     "Temperature": 0.7
   }
@@ -39,8 +39,8 @@ Place your GGUF model in the `Models/` directory:
 ```
 PorcelAIn/
 ├── Models/
-│   └── your-model.gguf    <- Your model file here
-├── Program.cs             <- Complete application (167 lines)
+│   └── phi-4-Q2_K.gguf    <- Your model file here
+├── Program.cs             <- Complete application (194 lines)
 ├── appsettings.json       <- Model configuration
 └── README.md              <- This file
 ```
@@ -86,7 +86,7 @@ Check API and model status
 {
   "status": "healthy",
   "model": "gguf", 
-  "modelPath": "./Models/your-model.gguf"
+  "modelPath": "./Models/phi-4-Q2_K.gguf"
 }
 ```
 
@@ -97,10 +97,10 @@ Get model information
 ```json
 {
   "type": "gguf",
-  "path": "./Models/your-model.gguf",
+  "path": "./Models/phi-4-Q2_K.gguf",
   "maxTokens": 2048,
   "contextWindow": 2048,
-  "modelSizeMB": 4096,
+  "modelSizeMB": 2048,
   "temperature": 0.7
 }
 ```
@@ -158,8 +158,8 @@ Creates a single executable (20-50MB) with no external dependencies.
 # Run with hot reload
 dotnet watch run Program.cs
 
-# Run with custom model
-Model__Path="./Models/different-model.gguf" dotnet run Program.cs
+# Run with custom model (Windows)
+$env:Model__Path="./Models/different-model.gguf"; dotnet run Program.cs
 ```
 
 ## Configuration
