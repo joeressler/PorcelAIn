@@ -8,10 +8,17 @@
 using LLama.Common;
 using LLama;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Diagnostics;
 
 // Configuration and startup
 var builder = WebApplication.CreateSlimBuilder(args);
+
+// Configure JSON serialization for AOT
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
+});
 var config = builder.Configuration;
 
 // Load model configuration
@@ -54,21 +61,6 @@ catch (Exception ex)
 
 var app = builder.Build();
 
-// Request/Response models
-record GenerateRequest(
-    string Prompt,
-    int MaxTokens = 100,
-    float Temperature = 0.7f,
-    float TopP = 0.9f,
-    string[]? StopSequences = null
-);
-
-record GenerateResponse(
-    string Text,
-    int TokensGenerated,
-    float ProcessingTimeMs
-);
-
 // API Endpoints
 app.MapPost("/generate", async (GenerateRequest request) =>
 {
@@ -77,8 +69,6 @@ app.MapPost("/generate", async (GenerateRequest request) =>
         var stopwatch = Stopwatch.StartNew();
         var inferenceParams = new InferenceParams()
         {
-            Temperature = request.Temperature,
-            TopP = request.TopP,
             MaxTokens = request.MaxTokens,
             AntiPrompts = request.StopSequences?.ToList() ?? new()
         };
@@ -108,12 +98,11 @@ app.MapPost("/generate", async (GenerateRequest request) =>
 app.MapGet("/health", () =>
 {
     var isHealthy = model != null && context != null && executor != null;
-    return Results.Ok(new
-    {
-        status = isHealthy ? "healthy" : "unhealthy",
-        model = modelType,
-        modelPath = modelPath
-    });
+    return Results.Ok(new HealthResponse(
+        Status: isHealthy ? "healthy" : "unhealthy",
+        Model: modelType,
+        ModelPath: modelPath
+    ));
 });
 
 app.MapGet("/info", () =>
@@ -121,15 +110,14 @@ app.MapGet("/info", () =>
     try
     {
         var fileInfo = new FileInfo(modelPath);
-        return Results.Ok(new
-        {
-            type = modelType,
-            path = modelPath,
-            maxTokens = maxTokens,
-            contextWindow = maxTokens,
-            modelSizeMB = fileInfo.Length / (1024 * 1024),
-            temperature = temperature
-        });
+        return Results.Ok(new ModelInfoResponse(
+            Type: modelType,
+            Path: modelPath,
+            MaxTokens: maxTokens,
+            ContextWindow: maxTokens,
+            ModelSizeMB: fileInfo.Length / (1024 * 1024),
+            Temperature: temperature
+        ));
     }
     catch (Exception ex)
     {
@@ -159,8 +147,47 @@ try
 finally
 {
     // Cleanup resources
-    executor?.Dispose();
+    // Note: InteractiveExecutor doesn't implement IDisposable
     context?.Dispose();
     model?.Dispose();
     Console.WriteLine("Resources cleaned up. Goodbye!");
+}
+
+// Request/Response models
+record GenerateRequest(
+    string Prompt,
+    int MaxTokens = 100,
+    float Temperature = 0.7f,
+    float TopP = 0.9f,
+    string[]? StopSequences = null
+);
+
+record GenerateResponse(
+    string Text,
+    int TokensGenerated,
+    float ProcessingTimeMs
+);
+
+record HealthResponse(
+    string Status,
+    string Model,
+    string ModelPath
+);
+
+record ModelInfoResponse(
+    string Type,
+    string Path,
+    int MaxTokens,
+    int ContextWindow,
+    long ModelSizeMB,
+    float Temperature
+);
+
+// JSON serialization context for AOT
+[JsonSerializable(typeof(GenerateRequest))]
+[JsonSerializable(typeof(GenerateResponse))]
+[JsonSerializable(typeof(HealthResponse))]
+[JsonSerializable(typeof(ModelInfoResponse))]
+internal partial class AppJsonSerializerContext : JsonSerializerContext
+{
 }

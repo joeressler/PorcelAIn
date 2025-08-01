@@ -6,3 +6,4 @@ obj/
 .vscode/
 wwwroot/lib/
 Models/      # Local LLM models (large files)
+*.gguf
