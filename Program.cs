@@ -39,7 +39,7 @@ Console.WriteLine($"Loading {modelType} model from: {modelPath}");
 var modelParams = new ModelParams(modelPath)
 {
     ContextSize = (uint)maxTokens,
-    GpuLayerCount = 0 // CPU only for maximum compatibility
+    GpuLayerCount = 25 // GPU acceleration - use 0 for CPU only
 };
 
 LLamaWeights? model = null;
@@ -67,10 +67,18 @@ app.MapPost("/generate", async (GenerateRequest request) =>
     try
     {
         var stopwatch = Stopwatch.StartNew();
+        // Configure proper inference parameters for Phi-4
         var inferenceParams = new InferenceParams()
         {
             MaxTokens = request.MaxTokens,
-            AntiPrompts = request.StopSequences?.ToList() ?? new()
+            AntiPrompts = request.StopSequences?.ToList() ?? new List<string>
+            {
+                "<|end|>",
+                "<|endoftext|>", 
+                "<|user|>",
+                "<|assistant|>",
+                "<|system|>"
+            }
         };
 
         var response = new List<string>();

@@ -4,7 +4,7 @@ A lightweight .NET 10 REST API for hosting a single local Large Language Model (
 
 ## Features
 
-- **Minimal footprint**: Single-file application (~194 lines)
+- **Minimal footprint**: Single-file application (~202 lines)
 - **Configuration-driven**: Model selection via `appsettings.json`
 - **GGUF support**: Optimized for llama.cpp models via LLamaSharp
 - **REST endpoints**: Simple HTTP API for text generation 
@@ -26,7 +26,7 @@ Edit `appsettings.json`:
   "Model": {
     "Type": "gguf",
     "Path": "./Models/phi-4-Q2_K.gguf", 
-    "MaxTokens": 2048,
+    "MaxTokens": 4096,
     "Temperature": 0.7
   }
 }
@@ -40,7 +40,7 @@ Place your GGUF model in the `Models/` directory:
 PorcelAIn/
 ├── Models/
 │   └── phi-4-Q2_K.gguf    <- Your model file here
-├── Program.cs             <- Complete application (194 lines)
+├── Program.cs             <- Complete application (202 lines)
 ├── appsettings.json       <- Model configuration
 └── README.md              <- This file
 ```
@@ -61,11 +61,11 @@ Generate text from a prompt
 **Request:**
 ```json
 {
-  "prompt": "Hello, how are you?",
+  "prompt": "<|user|>\nHello, how are you?<|end|>\n<|assistant|>\n",
   "maxTokens": 100,
   "temperature": 0.7,
   "topP": 0.9,
-  "stopSequences": ["Human:", "AI:"]
+  "stopSequences": ["<|end|>", "<|user|>"]
 }
 ```
 
@@ -98,9 +98,9 @@ Get model information
 {
   "type": "gguf",
   "path": "./Models/phi-4-Q2_K.gguf",
-  "maxTokens": 2048,
-  "contextWindow": 2048,
-  "modelSizeMB": 2048,
+  "maxTokens": 4096,
+  "contextWindow": 4096,
+  "modelSizeMB": 5286,
   "temperature": 0.7
 }
 ```
@@ -110,7 +110,12 @@ Get model information
 ### cURL Examples
 
 ```bash
-# Generate text
+# Generate text (Phi-4 format)
+curl -X POST http://localhost:5000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "<|user|>\nWhat is the meaning of life?<|end|>\n<|assistant|>\n", "maxTokens": 100, "stopSequences": ["<|end|>", "<|user|>"]}'
+
+# Generate text (simple)
 curl -X POST http://localhost:5000/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "The meaning of life is", "maxTokens": 50}'
@@ -127,11 +132,12 @@ curl http://localhost:5000/info
 ```python
 import requests
 
-# Generate text
+# Generate text (Phi-4 optimized format)
 response = requests.post('http://localhost:5000/generate', json={
-    'prompt': 'Write a haiku about programming:',
-    'maxTokens': 60,
-    'temperature': 0.8
+    'prompt': '<|user|>\nWrite a haiku about programming:<|end|>\n<|assistant|>\n',
+    'maxTokens': 100,
+    'temperature': 0.7,
+    'stopSequences': ['<|end|>', '<|user|>']
 })
 
 result = response.json()
@@ -164,18 +170,41 @@ $env:Model__Path="./Models/different-model.gguf"; dotnet run Program.cs
 
 ## Configuration
 
+### Basic Settings
+
 Environment variables override `appsettings.json`:
 
 - `Model__Path`: Path to model file
 - `Model__Type`: Model type (currently only "gguf")  
-- `Model__MaxTokens`: Maximum context size
+- `Model__MaxTokens`: Maximum context size (up to 16384 for Phi-4)
 - `Model__Temperature`: Default temperature
+
+### GPU Acceleration
+
+To enable GPU acceleration, modify `Program.cs` line 42:
+
+```csharp
+GpuLayerCount = 25 // Use 0 for CPU only, 20-35 for GPU acceleration
+```
+
+### Phi-4 Optimized Prompting
+
+For best results with Phi-4 models, use this format:
+
+```json
+{
+  "prompt": "<|user|>\nYour question here<|end|>\n<|assistant|>\n",
+  "maxTokens": 100,
+  "stopSequences": ["<|end|>", "<|user|>"]
+}
+```
 
 ## Requirements
 
-- **Memory**: Varies by model size (4GB+ recommended for 7B models)
+- **Memory**: Varies by model size (6GB+ recommended for Phi-4-Q2_K)
 - **CPU**: Any 64-bit processor (ARM64 supported)
-- **Storage**: Model file size + ~50MB for application
+- **GPU**: Optional CUDA-compatible GPU for acceleration
+- **Storage**: Model file size (~5.3GB for Phi-4-Q2_K) + ~50MB for application
 
 ## Troubleshooting
 
@@ -184,13 +213,25 @@ Environment variables override `appsettings.json`:
 - Ensure the model file exists and is readable
 
 ### "Failed to load model"
-- Check if you have enough RAM for the model
+- Check if you have enough RAM for the model (6GB+ for Phi-4)
 - Verify the GGUF file is not corrupted
-- Try a smaller quantized model (Q4_0, Q4_1)
+- Try a smaller quantized model (Q4_0, Q4_1, or Q2_K)
+
+### Model generates infinitely / doesn't stop
+- Phi-4 requires proper end tokens - the API automatically includes:
+  - `<|end|>`, `<|endoftext|>`, `<|user|>`, `<|assistant|>`, `<|system|>`
+- Use proper Phi-4 prompt format: `<|user|>\nYour prompt<|end|>\n<|assistant|>\n`
+- Always include `stopSequences` in your requests
+
+### GPU acceleration not working
+- Ensure you have CUDA installed and compatible GPU
+- Modify `GpuLayerCount` in `Program.cs` (line 42): `GpuLayerCount = 25`
+- Check GPU memory - Phi-4 requires 8GB+ VRAM for full GPU inference
 
 ### High memory usage
-- Reduce `MaxTokens` in configuration
-- Use a more quantized model variant
+- Reduce `MaxTokens` in configuration (try 2048 instead of 4096)
+- Use a more quantized model variant (Q2_K < Q4_0 < Q4_1 < Q5_0)
+- Set `GpuLayerCount = 0` to use CPU only
 - Enable `InvariantGlobalization=true` for smaller footprint
 
 ## License
