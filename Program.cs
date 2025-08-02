@@ -1,137 +1,127 @@
 ﻿#!/usr/bin/dotnet run
 #:sdk Microsoft.NET.Sdk.Web
-#:package Microsoft.ML.OnnxRuntime@1.*
-#:package Microsoft.ML.Tokenizers@0.*
+#:package Microsoft.ML.OnnxRuntimeGenAI@0.*
+#:package Microsoft.ML.OnnxRuntimeGenAI.DirectML@0.*
+#:package Microsoft.ML.OnnxRuntimeGenAI.CUDA@0.*
 #:property LangVersion=preview
-#:property PublishAot=true
+#:property PublishAot=false
 
-using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.Tokenizers;
+using Microsoft.ML.OnnxRuntimeGenAI;
 using System.Text.Json;
 using System.Diagnostics;
 using System.Collections.Generic;
+using System.Text;
 
 // Configuration and startup
 var builder = WebApplication.CreateSlimBuilder(args);
 var config = builder.Configuration;
 
-// Load model configuration
-var modelPath = config["Model:Path"] ?? "./Models/model.onnx";
-var modelType = config["Model:Type"]?.ToLower() ?? "onnx";
-var tokenizerPath = config["Model:TokenizerPath"] ?? "./Models/tokenizer.json";
+// Load model configuration - point to the Phi-3 model directory
+var modelDir = config["Model:Path"] ?? "./Models/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4";
 var maxTokens = config.GetValue<int>("Model:MaxTokens", 2048);
-var temperature = config.GetValue<float>("Model:Temperature", 0.7f);
+var temperature = config.GetValue<float>("Model:Temperature", 0.8f);
 
-// Validate model file exists
-if (!File.Exists(modelPath))
+// Validate model directory exists
+if (!Directory.Exists(modelDir))
 {
-    Console.WriteLine($"Error: Model file not found at {modelPath}");
+    Console.WriteLine($"Error: Model directory not found at {modelDir}");
     Environment.Exit(1);
 }
 
-// Initialize ONNX session options
-var sessionOptions = new SessionOptions
+// Validate required model files exist
+var modelFile = Path.Combine(modelDir, "model.onnx");
+if (!File.Exists(modelFile))
 {
-    ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
-    GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL
-};
+    Console.WriteLine($"Error: Model file not found at {modelFile}");
+    Environment.Exit(1);
+}
 
-InferenceSession? onnxSession = null;
+Model? model = null;
 Tokenizer? tokenizer = null;
+OgaHandle? ogaHandle = null;
 
 try
 {
-    Console.WriteLine($"Loading {modelType} model from: {modelPath}");
-    onnxSession = new InferenceSession(modelPath, sessionOptions);
+    Console.WriteLine($"Loading Phi-3 model from: {modelDir}");
+    var sw = Stopwatch.StartNew();
     
-    // Load tokenizer if available
-    if (File.Exists(tokenizerPath))
-    {
-        Console.WriteLine($"Loading tokenizer from: {tokenizerPath}");
-        tokenizer = Tokenizer.CreateTiktokenForModel("gpt-4"); // Fallback tokenizer
-    }
-    else
-    {
-        Console.WriteLine("Using default tokenizer");
-        tokenizer = Tokenizer.CreateTiktokenForModel("gpt-4");
-    }
+    ogaHandle = new OgaHandle();
     
-    Console.WriteLine("ONNX model loaded successfully!");
+    using var modelConfig = new Config(modelDir);
+    // Don't clear providers - use default CPU provider
+    
+    model = new Model(modelConfig);
+    tokenizer = new Tokenizer(model);
+    
+    sw.Stop();
+    Console.WriteLine($"Phi-3 model loaded successfully in {sw.ElapsedMilliseconds} ms!");
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"Failed to load ONNX model: {ex.Message}");
+    Console.WriteLine($"Failed to load Phi-3 model: {ex.Message}");
     Environment.Exit(1);
 }
 
 var app = builder.Build();
 
-// Request/Response models
-record GenerateRequest(
-    string Prompt,
-    int MaxTokens = 100,
-    float Temperature = 0.7f,
-    float TopP = 0.9f,
-    string[]? StopSequences = null
-);
-
-record GenerateResponse(
-    string Text,
-    int TokensGenerated,
-    float ProcessingTimeMs
-);
-
 // API Endpoints
-app.MapPost("/generate", async (GenerateRequest request) =>
+app.MapPost("/generate", (GenerateRequest request) =>
 {
     try
     {
         var stopwatch = Stopwatch.StartNew();
         
-        // Tokenize input prompt
-        var encodedTokens = tokenizer!.EncodeToIds(request.Prompt);
-        var inputIds = encodedTokens.ToArray();
+        // Format prompt for Phi-3 model
+        var systemPrompt = "You are a helpful assistant.";
+        var formattedPrompt = $"<|system|>{systemPrompt}<|end|><|user|>{request.Prompt}<|end|><|assistant|>";
         
-        // Prepare input tensors
-        var inputTensor = NamedOnnxValue.CreateFromTensor("input_ids", 
-            new DenseTensor<long>(inputIds.Select(x => (long)x).ToArray(), new[] { 1, inputIds.Length }));
+        // Encode the prompt using the exact pattern from the official example
+        var sequences = tokenizer!.Encode(formattedPrompt);
         
-        var inputs = new List<NamedOnnxValue> { inputTensor };
+        // Create generator parameters using the official pattern
+        using var generatorParams = new GeneratorParams(model!);
+        generatorParams.SetSearchOption("min_length", 10);
+        generatorParams.SetSearchOption("max_length", request.MaxTokens);
         
-        // Generate tokens
-        var generatedTokens = new List<int>(inputIds);
+        // Generate text using the official streaming pattern
+        using var tokenizerStream = tokenizer.CreateStream();
+        using var generator = new Generator(model, generatorParams);
+        generator.AppendTokenSequences(sequences);
+        
+        var generatedText = new StringBuilder();
         var tokensGenerated = 0;
         
-        for (int i = 0; i < request.MaxTokens && tokensGenerated < request.MaxTokens; i++)
+        while (!generator.IsDone() && tokensGenerated < request.MaxTokens)
         {
-            // Run inference
-            using var results = onnxSession!.Run(inputs);
-            var logits = results.First().AsTensor<float>();
-            
-            // Apply temperature sampling
-            var nextTokenId = SampleWithTemperature(logits, request.Temperature);
-            generatedTokens.Add(nextTokenId);
+            generator.GenerateNextToken();
+            var newToken = tokenizerStream.Decode(generator.GetSequence(0)[^1]);
+            generatedText.Append(newToken);
             tokensGenerated++;
             
             // Check for stop sequences
-            var currentText = tokenizer.Decode(generatedTokens.Skip(inputIds.Length).ToArray());
-            if (request.StopSequences?.Any(stop => currentText.Contains(stop)) == true)
+            var currentOutput = generatedText.ToString();
+            if (request.StopSequences?.Any(stop => currentOutput.Contains(stop)) == true ||
+                currentOutput.Contains("<|end|>") || 
+                currentOutput.Contains("<|user|>") ||
+                currentOutput.Contains("<|system|>"))
+            {
                 break;
-            
-            // Update input for next iteration (sliding window approach)
-            var newInputIds = generatedTokens.TakeLast(Math.Min(generatedTokens.Count, 512)).ToArray();
-            inputTensor = NamedOnnxValue.CreateFromTensor("input_ids",
-                new DenseTensor<long>(newInputIds.Select(x => (long)x).ToArray(), new[] { 1, newInputIds.Length }));
-            inputs[0] = inputTensor;
+            }
         }
+        
+        var outputText = generatedText.ToString();
         
         stopwatch.Stop();
         
-        // Decode only the generated portion
-        var generatedText = tokenizer.Decode(generatedTokens.Skip(inputIds.Length).ToArray());
+        // Clean up the generated text (remove any special tokens that leaked through)
+        var cleanedText = outputText
+            .Replace("<|end|>", "")
+            .Replace("<|user|>", "")
+            .Replace("<|system|>", "")
+            .Trim();
         
         return Results.Ok(new GenerateResponse(
-            Text: generatedText,
+            Text: cleanedText,
             TokensGenerated: tokensGenerated,
             ProcessingTimeMs: (float)stopwatch.Elapsed.TotalMilliseconds
         ));
@@ -143,51 +133,16 @@ app.MapPost("/generate", async (GenerateRequest request) =>
     }
 });
 
-// Helper method for temperature sampling
-static int SampleWithTemperature(Tensor<float> logits, float temperature)
-{
-    var lastTokenLogits = logits.GetSlice(new[] { 0L, logits.Dimensions[1] - 1 }).ToArray();
-    
-    if (temperature <= 0.0f)
-    {
-        // Greedy sampling - return token with highest probability
-        return Array.IndexOf(lastTokenLogits, lastTokenLogits.Max());
-    }
-    
-    // Apply temperature
-    for (int i = 0; i < lastTokenLogits.Length; i++)
-    {
-        lastTokenLogits[i] /= temperature;
-    }
-    
-    // Softmax
-    var maxLogit = lastTokenLogits.Max();
-    var expLogits = lastTokenLogits.Select(x => Math.Exp(x - maxLogit)).ToArray();
-    var sumExp = expLogits.Sum();
-    var probabilities = expLogits.Select(x => x / sumExp).ToArray();
-    
-    // Sample from probability distribution
-    var random = new Random();
-    var sample = random.NextDouble();
-    var cumulative = 0.0;
-    
-    for (int i = 0; i < probabilities.Length; i++)
-    {
-        cumulative += probabilities[i];
-        if (sample < cumulative) return i;
-    }
-    
-    return probabilities.Length - 1;
-}
+
 
 app.MapGet("/health", () =>
 {
-    var isHealthy = onnxSession != null && tokenizer != null;
+    var isHealthy = model != null && tokenizer != null;
     return Results.Ok(new
     {
         status = isHealthy ? "healthy" : "unhealthy",
-        model = modelType,
-        modelPath = modelPath
+        model = "phi3",
+        modelPath = modelDir
     });
 });
 
@@ -195,13 +150,14 @@ app.MapGet("/info", () =>
 {
     try
     {
-        var fileInfo = new FileInfo(modelPath);
+        var modelFile = Path.Combine(modelDir, "model.onnx");
+        var fileInfo = new FileInfo(modelFile);
         return Results.Ok(new
         {
-            type = modelType,
-            path = modelPath,
+            type = "phi3",
+            path = modelDir,
             maxTokens = maxTokens,
-            contextWindow = maxTokens,
+            contextWindow = 32768, // Phi-3 context window
             modelSizeMB = fileInfo.Length / (1024 * 1024),
             temperature = temperature
         });
@@ -234,7 +190,23 @@ try
 finally
 {
     // Cleanup resources
-    onnxSession?.Dispose();
+    model?.Dispose();
     tokenizer?.Dispose();
+    ogaHandle?.Dispose();
     Console.WriteLine("Resources cleaned up. Goodbye!");
 }
+
+// Request/Response models
+record GenerateRequest(
+    string Prompt,
+    int MaxTokens = 100,
+    float Temperature = 0.7f,
+    float TopP = 0.9f,
+    string[]? StopSequences = null
+);
+
+record GenerateResponse(
+    string Text,
+    int TokensGenerated,
+    float ProcessingTimeMs
+);
